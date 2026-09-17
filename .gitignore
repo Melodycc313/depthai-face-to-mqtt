@@ -1,2 +1,14 @@
 databases/*.npz
 databases/*.jpg
+# Python environment and cache
+venv_oak_gen2/
+__pycache__/
+.cache/
+
+# Face recognition data
+databases/
+test_empty_db/
+face_database/
+
+# Local backup
+main_original_backup.py
