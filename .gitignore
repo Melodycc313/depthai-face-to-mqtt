@@ -12,3 +12,4 @@ face_database/
 
 # Local backup
 main_original_backup.py
+/face_profiles_gen2/
