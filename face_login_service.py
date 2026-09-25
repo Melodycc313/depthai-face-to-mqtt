@@ -8,8 +8,17 @@ import argparse
 from time import sleep
 import threading
 import logging
+import socket
+import json
+from datetime import datetime, timezone
+from urllib import request as urllib_request
+from urllib import error as urllib_error
+from urllib.parse import quote
 
 import cv2
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 import depthai
 import numpy as np
 from imutils.video import FPS
@@ -35,6 +44,48 @@ args = parser.parse_args()
 preview = args.preview
 logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+# ============================================================
+# Face Preview -> Unity
+# ============================================================
+# Face 辨識期間由同一個 OAK-D pipeline 取得影像，
+# 將目前正在辨識的 frame 壓成 JPEG 後送到 Unity。
+# 不額外開第二個相機，也不碰 Pose 的 5004 / 5005 / 5006。
+FACE_PREVIEW_HOST = "127.0.0.1"
+FACE_PREVIEW_PORT = 5007
+FACE_PREVIEW_FPS = 10.0
+FACE_PREVIEW_JPEG_QUALITY = 65
+
+# 讓 Unity 先顯示玩家自己的 FaceCameraPreview，
+# 再開始接受登入比對結果，避免「先登入成功、後看到自己」。
+FACE_LOGIN_PREVIEW_WARMUP_SECONDS = 2.0
+
+# ============================================================
+# Face Guide Gate
+# ============================================================
+# 只有臉位於中央安全區域、且大小合理時，才真正送進 ArcFace 比對。
+# 座標皆以 0~1 表示相機畫面比例。
+FACE_GUIDE_LEFT = 0.18
+FACE_GUIDE_RIGHT = 0.82
+FACE_GUIDE_TOP = 0.10
+FACE_GUIDE_BOTTOM = 0.90
+
+FACE_MIN_WIDTH_RATIO = 0.18
+FACE_MIN_HEIGHT_RATIO = 0.22
+FACE_MAX_WIDTH_RATIO = 0.72
+FACE_MAX_HEIGHT_RATIO = 0.82
+
+# ============================================================
+# Face 模式舉手取消（MediaPipe PoseLandmarker）
+# ============================================================
+POSE_LANDMARKER_MODEL = (
+    Path(__file__).resolve().parent / "models" / "pose_landmarker_lite.task"
+)
+FACE_CANCEL_POSE_FPS = 10.0
+FACE_CANCEL_HOLD_SECONDS = 1.2
+FACE_CANCEL_WRIST_ABOVE_NOSE_MARGIN = 0.035
+FACE_CANCEL_MIN_VISIBILITY = 0.45
 
 def to_planar(arr: np.ndarray, shape: tuple):
     return cv2.resize(arr, shape).transpose((2, 0, 1)).flatten()
@@ -81,6 +132,276 @@ MATCH_THRESHOLD = 0.85   # Trial value, NOT a validated security threshold.
 AMBIGUITY_MARGIN = 0.05
 OPERATION_TIMEOUT = 35.0
 SAMPLE_GAP_SECONDS = 0.35
+
+# ============================================================
+# Supabase biometric sync (server-side only)
+# ============================================================
+# The secret key MUST stay in Windows environment variables.
+# Do not put it in Unity, source code, screenshots, or Git.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
+SUPABASE_FACE_PHOTO_BUCKET = "face-photos"
+SUPABASE_MODEL_NAME = "arcface"
+SUPABASE_MODEL_VERSION = "face-recognition-mobilefacenet-arcface_2021.2_4shave"
+SUPABASE_HTTP_TIMEOUT_SECONDS = 15.0
+SUPABASE_PHOTO_JPEG_QUALITY = 90
+
+
+def _supabase_is_configured():
+    return bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+
+
+def _supabase_request(method, path, payload=None, headers=None, raw_body=None):
+    if not _supabase_is_configured():
+        raise RuntimeError(
+            "Supabase environment variables are missing: "
+            "SUPABASE_URL / SUPABASE_SECRET_KEY"
+        )
+
+    url = SUPABASE_URL + path
+    req_headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "User-Agent": "GroceryStoreGame-FaceService/1.0",
+    }
+
+    if headers:
+        req_headers.update(headers)
+
+    body = raw_body
+    if payload is not None:
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json")
+
+    req = urllib_request.Request(
+        url=url,
+        data=body,
+        headers=req_headers,
+        method=method,
+    )
+
+    try:
+        with urllib_request.urlopen(
+            req,
+            timeout=SUPABASE_HTTP_TIMEOUT_SECONDS,
+        ) as response:
+            data = response.read()
+            if not data:
+                return None
+            content_type = response.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                return json.loads(data.decode("utf-8"))
+            return data
+    except urllib_error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        raise RuntimeError(
+            f"Supabase HTTP {exc.code} for {method} {path}: {detail}"
+        ) from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(
+            f"Supabase connection failed for {method} {path}: {exc}"
+        ) from exc
+
+
+def _supabase_create_face_profile(user_id):
+    rows = _supabase_request(
+        "POST",
+        "/rest/v1/face_profiles?select=face_profile_id",
+        payload={
+            "user_id": int(user_id),
+            "model_name": SUPABASE_MODEL_NAME,
+            "model_version": SUPABASE_MODEL_VERSION,
+            "is_active": False,
+        },
+        headers={
+            "Prefer": "return=representation",
+        },
+    )
+
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("Supabase did not return face_profile_id")
+
+    face_profile_id = rows[0].get("face_profile_id")
+    if face_profile_id is None:
+        raise RuntimeError("Supabase response missing face_profile_id")
+
+    return int(face_profile_id)
+
+
+def _supabase_insert_embeddings(face_profile_id, samples):
+    rows = []
+    for sample_index, vector in enumerate(samples):
+        arr = np.asarray(vector, dtype=np.float32).reshape(-1)
+        if arr.size != 128 or not np.all(np.isfinite(arr)):
+            raise ValueError(
+                f"invalid embedding at sample_index={sample_index}"
+            )
+
+        rows.append({
+            "face_profile_id": int(face_profile_id),
+            "sample_index": int(sample_index),
+            "embedding": [float(v) for v in arr.tolist()],
+        })
+
+    if len(rows) != SAMPLES_REQUIRED:
+        raise ValueError("cloud sync requires exactly 12 embeddings")
+
+    _supabase_request(
+        "POST",
+        "/rest/v1/face_embeddings",
+        payload=rows,
+        headers={
+            "Prefer": "return=minimal",
+        },
+    )
+
+
+def _supabase_upload_profile_photo(user_id, face_profile_id, photo_bgr):
+    if photo_bgr is None or photo_bgr.size == 0:
+        raise ValueError("representative face photo is missing")
+
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        photo_bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), SUPABASE_PHOTO_JPEG_QUALITY],
+    )
+    if not ok:
+        raise RuntimeError("failed to encode representative face photo")
+
+    object_path = (
+        f"user_{int(user_id)}/"
+        f"profile_{int(face_profile_id)}.jpg"
+    )
+    encoded_path = quote(object_path, safe="/")
+
+    _supabase_request(
+        "POST",
+        f"/storage/v1/object/{SUPABASE_FACE_PHOTO_BUCKET}/{encoded_path}",
+        headers={
+            "Content-Type": "image/jpeg",
+            "x-upsert": "false",
+        },
+        raw_body=encoded.tobytes(),
+    )
+
+    return object_path
+
+
+def _supabase_activate_profile(user_id, face_profile_id, photo_path):
+    # First finish the new profile itself.
+    _supabase_request(
+        "PATCH",
+        (
+            "/rest/v1/face_profiles"
+            f"?face_profile_id=eq.{int(face_profile_id)}"
+        ),
+        payload={
+            "photo_path": photo_path,
+            "is_active": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        headers={
+            "Prefer": "return=minimal",
+        },
+    )
+
+    # Only after the new profile is complete, deactivate older active profiles.
+    _supabase_request(
+        "PATCH",
+        (
+            "/rest/v1/face_profiles"
+            f"?user_id=eq.{int(user_id)}"
+            f"&is_active=eq.true"
+            f"&face_profile_id=neq.{int(face_profile_id)}"
+        ),
+        payload={
+            "is_active": False,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        headers={
+            "Prefer": "return=minimal",
+        },
+    )
+
+
+def _supabase_delete_profile(face_profile_id):
+    try:
+        _supabase_request(
+            "DELETE",
+            (
+                "/rest/v1/face_profiles"
+                f"?face_profile_id=eq.{int(face_profile_id)}"
+            ),
+            headers={
+                "Prefer": "return=minimal",
+            },
+        )
+    except Exception:
+        logging.exception(
+            "Failed to clean up incomplete Supabase face profile %s",
+            face_profile_id,
+        )
+
+
+def sync_registration_to_supabase(user_id, samples, representative_photo):
+    """
+    Store one face profile, exactly 12 x 128-d embeddings, and one private
+    representative face photo.
+
+    This runs in a background thread so cloud latency cannot delay the
+    OAK-D camera handoff or the existing local .npz login flow.
+    """
+    if not _supabase_is_configured():
+        raise RuntimeError(
+            "Supabase sync is not configured. "
+            "Set SUPABASE_URL and SUPABASE_SECRET_KEY."
+        )
+
+    if not isinstance(user_id, str) or not user_id.isdigit():
+        raise ValueError(
+            "Supabase face sync requires a numeric user_id string"
+        )
+
+    cloud_samples = [
+        np.asarray(v, dtype=np.float32).copy()
+        for v in samples
+    ]
+    if len(cloud_samples) != SAMPLES_REQUIRED:
+        raise ValueError("cloud sync requires exactly 12 samples")
+
+    face_profile_id = None
+    try:
+        face_profile_id = _supabase_create_face_profile(user_id)
+        _supabase_insert_embeddings(face_profile_id, cloud_samples)
+        photo_path = _supabase_upload_profile_photo(
+            user_id,
+            face_profile_id,
+            representative_photo,
+        )
+        _supabase_activate_profile(
+            user_id,
+            face_profile_id,
+            photo_path,
+        )
+        logging.info(
+            "Supabase face sync complete | user_id=%s | "
+            "face_profile_id=%s | embeddings=%d | photo=%s",
+            user_id,
+            face_profile_id,
+            len(cloud_samples),
+            photo_path,
+        )
+        return face_profile_id
+    except Exception:
+        if face_profile_id is not None:
+            _supabase_delete_profile(face_profile_id)
+        raise
 
 
 def normalize_embedding(values):
@@ -153,6 +474,174 @@ class DepthAI:
             raise
         self.fontScale = 1
         self.lineType = 0
+
+        # Face Preview UDP sender.
+        # 只在 Face pipeline 實際持有 OAK-D 時存在。
+        self._preview_udp_socket = None
+        self._last_preview_send_at = 0.0
+
+        # Face 模式下的舉手取消。
+        # 使用同一張 OAK-D frame，不會再開第二個相機 pipeline。
+        self.on_cancel_gesture = None
+        self._pose_landmarker = None
+        self._last_pose_process_at = 0.0
+        self._cancel_raise_started_at = None
+        self._cancel_wait_for_release = True
+        self._cancel_confirmed = False
+
+        self._create_pose_landmarker()
+
+    def _create_pose_landmarker(self):
+        if not POSE_LANDMARKER_MODEL.exists():
+            logging.warning(
+                "PoseLandmarker model not found: %s",
+                POSE_LANDMARKER_MODEL,
+            )
+            return
+
+        try:
+            options = mp_vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(
+                    model_asset_path=str(POSE_LANDMARKER_MODEL)
+                ),
+                running_mode=mp_vision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            self._pose_landmarker = (
+                mp_vision.PoseLandmarker.create_from_options(options)
+            )
+            logging.info(
+                "MediaPipe PoseLandmarker ready for Face cancel gesture."
+            )
+        except Exception:
+            logging.exception(
+                "Failed to initialize MediaPipe PoseLandmarker; "
+                "Face recognition will continue without raise-hand cancel."
+            )
+            self._pose_landmarker = None
+
+    def _close_pose_landmarker(self):
+        if self._pose_landmarker is None:
+            return
+        try:
+            self._pose_landmarker.close()
+        except Exception:
+            logging.exception("Failed to close PoseLandmarker")
+        finally:
+            self._pose_landmarker = None
+
+    def _report_cancel_gesture(self, progress, confirmed=False):
+        if self.on_cancel_gesture is not None:
+            self.on_cancel_gesture(
+                float(np.clip(progress, 0.0, 1.0)),
+                bool(confirmed),
+            )
+
+    def _reset_cancel_gesture(self):
+        self._cancel_raise_started_at = None
+        if not self._cancel_confirmed:
+            self._report_cancel_gesture(0.0, False)
+
+    @staticmethod
+    def _landmark_visible(landmark):
+        visibility = getattr(landmark, "visibility", 1.0)
+        presence = getattr(landmark, "presence", 1.0)
+        return (
+            visibility >= FACE_CANCEL_MIN_VISIBILITY
+            and presence >= FACE_CANCEL_MIN_VISIBILITY
+        )
+
+    def _process_cancel_gesture(self):
+        """
+        Face 擁有 OAK-D 時，直接從 Face pipeline 的同一張 frame
+        判斷玩家是否把任一手腕舉到鼻子上方。
+        """
+        if self._pose_landmarker is None or self._cancel_confirmed:
+            return
+
+        now = monotonic()
+        min_interval = 1.0 / max(1.0, FACE_CANCEL_POSE_FPS)
+        if now - self._last_pose_process_at < min_interval:
+            return
+        self._last_pose_process_at = now
+
+        try:
+            rgb = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=np.ascontiguousarray(rgb),
+            )
+            result = self._pose_landmarker.detect(mp_image)
+        except Exception:
+            logging.exception("PoseLandmarker detect failed")
+            self._reset_cancel_gesture()
+            return
+
+        if not result.pose_landmarks:
+            # 沒有人時進度歸零；同時視為已經「放下手」。
+            self._cancel_wait_for_release = False
+            self._reset_cancel_gesture()
+            return
+
+        landmarks = result.pose_landmarks[0]
+        nose = landmarks[0]
+        left_wrist = landmarks[15]
+        right_wrist = landmarks[16]
+
+        nose_ok = self._landmark_visible(nose)
+        left_ok = self._landmark_visible(left_wrist)
+        right_ok = self._landmark_visible(right_wrist)
+
+        left_raised = (
+            nose_ok
+            and left_ok
+            and left_wrist.y
+            < nose.y - FACE_CANCEL_WRIST_ABOVE_NOSE_MARGIN
+        )
+        right_raised = (
+            nose_ok
+            and right_ok
+            and right_wrist.y
+            < nose.y - FACE_CANCEL_WRIST_ABOVE_NOSE_MARGIN
+        )
+        any_raised = left_raised or right_raised
+
+        # 玩家通常剛在 FaceConsent 用舉手確認；
+        # 必須先放下，再重新舉手，才允許取消。
+        if self._cancel_wait_for_release:
+            if not any_raised:
+                self._cancel_wait_for_release = False
+                self._reset_cancel_gesture()
+            return
+
+        if not any_raised:
+            self._reset_cancel_gesture()
+            return
+
+        if self._cancel_raise_started_at is None:
+            self._cancel_raise_started_at = now
+            logging.info(
+                "Raised hand detected in Face mode; "
+                "starting %.1f s cancel hold.",
+                FACE_CANCEL_HOLD_SECONDS,
+            )
+
+        progress = float(np.clip(
+            (now - self._cancel_raise_started_at)
+            / max(0.2, FACE_CANCEL_HOLD_SECONDS),
+            0.0,
+            1.0,
+        ))
+
+        if progress >= 1.0:
+            self._cancel_confirmed = True
+            self._report_cancel_gesture(1.0, True)
+            logging.info("Face cancel gesture confirmed by raised hand.")
+        else:
+            self._report_cancel_gesture(progress, False)
 
     def create_pipeline(self):
         logging.debug("Creating pipeline...")
@@ -296,6 +785,78 @@ class DepthAI:
                 )
                 raise StopIteration()
 
+    def _ensure_preview_socket(self):
+        """建立 Face Preview UDP socket；失敗時只停用預覽，不中斷辨識。"""
+        if self._preview_udp_socket is not None:
+            return True
+
+        try:
+            self._preview_udp_socket = socket.socket(
+                socket.AF_INET,
+                socket.SOCK_DGRAM,
+            )
+            return True
+        except OSError as exc:
+            logging.warning("Face Preview socket 建立失敗：%s", exc)
+            self._preview_udp_socket = None
+            return False
+
+    def _send_preview_frame(self):
+        """將目前 frame 以 JPEG UDP 傳給 Unity 的 FaceCameraPreview。"""
+        if not hasattr(self, "frame") or self.frame is None:
+            return
+
+        now = monotonic()
+        min_interval = 1.0 / max(1.0, FACE_PREVIEW_FPS)
+
+        if now - self._last_preview_send_at < min_interval:
+            return
+
+        if not self._ensure_preview_socket():
+            return
+
+        try:
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                self.frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), FACE_PREVIEW_JPEG_QUALITY],
+            )
+
+            if not ok:
+                return
+
+            payload = encoded.tobytes()
+
+            # 單一 UDP datagram 理論上限約 65 KB。
+            # 目前 Face preview 為 300x300，quality=65 通常遠低於此上限。
+            if len(payload) > 60000:
+                logging.warning(
+                    "Face Preview JPEG 過大（%d bytes），本張略過",
+                    len(payload),
+                )
+                return
+
+            self._preview_udp_socket.sendto(
+                payload,
+                (FACE_PREVIEW_HOST, FACE_PREVIEW_PORT),
+            )
+            self._last_preview_send_at = now
+
+        except OSError as exc:
+            # Preview 失敗不應讓人臉辨識本身失敗。
+            logging.debug("Face Preview UDP 傳送失敗：%s", exc)
+
+    def _close_preview_socket(self):
+        if self._preview_udp_socket is None:
+            return
+
+        try:
+            self._preview_udp_socket.close()
+        except OSError:
+            pass
+        finally:
+            self._preview_udp_socket = None
+
     def run_camera(self, stop_event=None):
         while stop_event is None or not stop_event.is_set():
             in_rgb = self.preview.tryGet()
@@ -308,6 +869,14 @@ class DepthAI:
                     in_rgb.getData().reshape(shape).transpose(1, 2, 0).astype(np.uint8)
                 )
                 self.frame = np.ascontiguousarray(self.frame)
+
+                # 直接使用 Face pipeline 正在辨識的同一張 frame。
+                # 即使目前沒有偵測到臉，玩家仍能在 Unity 看見自己並調整位置。
+                self._send_preview_frame()
+
+                # Face 持有相機時，用同一張 frame 偵測「舉手取消」。
+                self._process_cancel_gesture()
+
                 try:
                     self.parse()
                 except StopIteration:
@@ -329,6 +898,10 @@ class DepthAI:
         try:
             self.run_camera(stop_event)
         finally:
+            # 先關閉 CPU 端 PoseLandmarker / Preview，再釋放 OAK-D。
+            self._close_pose_landmarker()
+            self._close_preview_socket()
+
             logging.info("Closing OAK-D device...")
             try:
                 self.device.close()
@@ -347,6 +920,10 @@ class Main(DepthAI):
         self.face_coords = Queue()
         self.embedding_count = 0
         self.on_embedding = None
+
+        # 回報目前玩家是否已進入臉部引導框。
+        # 狀態：waiting_face / multiple_faces / adjust_position / running
+        self.on_face_state = None
         self.stop_event = threading.Event()
 
     def create_nns(self):
@@ -374,28 +951,78 @@ class Main(DepthAI):
         self.arcface_in = self.device.getInputQueue("arcface_in", 4, False)
         self.arcface_nn = self.device.getOutputQueue("arcface_nn", 4, False)
 
+    def _report_face_state(self, face_state):
+        if self.on_face_state is not None:
+            self.on_face_state(face_state)
+
     def run_face_mn(self):
         nn_data = self.mfd_nn.tryGet()
         if nn_data is None:
             return False
 
         bboxes = nn_data.detections
-        # Reject ambiguous/multiple-face frames for both enrollment and matching.
-        if len(bboxes) != 1:
+
+        if len(bboxes) == 0:
+            self._report_face_state("waiting_face")
             return False
-        for bbox in bboxes:
-            if self.stop_event.is_set():
-                break
-            face_coord = frame_norm(
-                self.frame.shape[:2], *[bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax]
-            )
-            crop = self.frame[face_coord[1]:face_coord[3], face_coord[0]:face_coord[2]]
-            if crop.size == 0:
-                return False
-            self.face_frame.put(crop)
-            self.face_coords.put(face_coord)
-            if preview:
-                self.draw_bbox(face_coord, (10, 245, 10))
+
+        # 登入 / 註冊都只允許一張臉。
+        if len(bboxes) != 1:
+            self._report_face_state("multiple_faces")
+            return False
+
+        bbox = bboxes[0]
+
+        if self.stop_event.is_set():
+            return False
+
+        # 先直接使用 detector 的 0~1 座標判斷是否位於中央引導區。
+        xmin = float(np.clip(bbox.xmin, 0.0, 1.0))
+        ymin = float(np.clip(bbox.ymin, 0.0, 1.0))
+        xmax = float(np.clip(bbox.xmax, 0.0, 1.0))
+        ymax = float(np.clip(bbox.ymax, 0.0, 1.0))
+
+        face_w = xmax - xmin
+        face_h = ymax - ymin
+
+        inside_guide = (
+            xmin >= FACE_GUIDE_LEFT and
+            xmax <= FACE_GUIDE_RIGHT and
+            ymin >= FACE_GUIDE_TOP and
+            ymax <= FACE_GUIDE_BOTTOM
+        )
+
+        size_ok = (
+            FACE_MIN_WIDTH_RATIO <= face_w <= FACE_MAX_WIDTH_RATIO and
+            FACE_MIN_HEIGHT_RATIO <= face_h <= FACE_MAX_HEIGHT_RATIO
+        )
+
+        if not inside_guide or not size_ok:
+            self._report_face_state("adjust_position")
+            return False
+
+        # 到這裡才代表玩家真的在框框內，可以開始辨識。
+        self._report_face_state("running")
+
+        face_coord = frame_norm(
+            self.frame.shape[:2],
+            *[bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax]
+        )
+
+        crop = self.frame[
+            face_coord[1]:face_coord[3],
+            face_coord[0]:face_coord[2]
+        ]
+
+        if crop.size == 0:
+            self._report_face_state("adjust_position")
+            return False
+
+        self.face_frame.put(crop)
+        self.face_coords.put(face_coord)
+
+        if preview:
+            self.draw_bbox(face_coord, (10, 245, 10))
 
         return True
 
@@ -444,7 +1071,11 @@ class Main(DepthAI):
 
             if results.size == 128 and np.isfinite(results).all() and np.linalg.norm(results) > 0:
                 if self.on_embedding is not None:
-                    self.on_embedding(self.embedding_count, results)
+                    self.on_embedding(
+                        self.embedding_count,
+                        results,
+                        face_frame.copy(),
+                    )
             else:
                 logging.warning("Invalid ArcFace output ignored")
 
@@ -480,17 +1111,41 @@ class FaceController:
         self.enroll_user = None
         self.samples = []
         self.last_sample_at = 0.0
+        self.best_register_photo = None
+        self.best_register_photo_score = -1.0
+        self.cloud_sync_state = "idle"
+        self.cloud_sync_error = None
+        self.cloud_face_profile_id = None
+        self.cloud_sync_worker = None
         self.deadline = 0.0
         self.match_name = None
         self.match_streak = 0
         self.profiles = {}
+
+        # Login UX：Face 相機開始後，先讓 Unity 預覽一小段時間，
+        # 再允許人臉比對成功。
+        self.login_match_allowed_at = 0.0
+
+        # True only when the Face pipeline no longer owns OAK-D.
+        # Unity should wait for this before sending POSE_START.
+        self.camera_released = True
+
+        # Face 模式 MediaPipe 舉手取消狀態，供 Unity status 輪詢。
+        self.cancel_progress = 0.0
+        self.cancel_gesture_confirmed = False
 
     def status(self):
         with self.lock:
             result = {"ok": True, "state": self.state,
                       "embedding_count": self.embedding_count,
                       "authenticated": self.authenticated,
-                      "user_id": self.user_id, "error": self.last_error}
+                      "user_id": self.user_id, "error": self.last_error,
+                      "camera_released": self.camera_released,
+                      "cancel_progress": self.cancel_progress,
+                      "cancel_gesture_confirmed": self.cancel_gesture_confirmed,
+                      "cloud_sync_state": self.cloud_sync_state,
+                      "cloud_sync_error": self.cloud_sync_error,
+                      "cloud_face_profile_id": self.cloud_face_profile_id}
             if self.operation == "register" and self.state in ("starting", "running", "stopping"):
                 result["samples_collected"] = len(self.samples)
                 result["samples_required"] = SAMPLES_REQUIRED
@@ -536,10 +1191,30 @@ class FaceController:
                 self.enroll_user = user_id if command == "register" else None
                 self.samples = []
                 self.last_sample_at = 0.0
+                self.best_register_photo = None
+                self.best_register_photo_score = -1.0
+                if command == "register":
+                    self.cloud_sync_state = "waiting"
+                    self.cloud_sync_error = None
+                    self.cloud_face_profile_id = None
                 self.deadline = monotonic() + OPERATION_TIMEOUT
                 self.match_name = None
                 self.match_streak = 0
                 self.profiles = profiles if command == "login" else {}
+                self.cancel_progress = 0.0
+                self.cancel_gesture_confirmed = False
+
+                # 不能在收到 login 指令時就開始計時：
+                # OAK-D pipeline 本身需要數秒啟動，若此時開始，
+                # 等真正看到玩家時 warm-up 早就結束了。
+                #
+                # 改成等玩家「第一次真正進入臉部框」時，
+                # 才由 _process_face_state() 開始倒數。
+                self.login_match_allowed_at = 0.0
+
+                # From this point onward Face owns, or is about to own, the OAK-D.
+                # Do not let Pose restart until _camera_worker finally marks it released.
+                self.camera_released = False
                 self.state = "starting"
                 self.worker = threading.Thread(target=self._camera_worker,
                                                args=(self.stop_event,),
@@ -553,7 +1228,11 @@ class FaceController:
                 self.authenticated = False
                 self.user_id = None
                 self.samples = []
-                if self.state in ("starting", "running", "stopping") or (
+                self.cancel_progress = 0.0
+                self.cancel_gesture_confirmed = False
+                if self.state in ("starting", "running", "stopping",
+                                  "waiting_face", "multiple_faces",
+                                  "adjust_position") or (
                     self.worker is not None and self.worker.is_alive()
                 ):
                     self.stop_target = target
@@ -563,12 +1242,165 @@ class FaceController:
                     self.state = target
                     self.last_error = None
                     self.operation = None
+                    self.camera_released = True
                 state = self.state
             return {"ok": True, "state": state,
                     "message": "Wait for status=guest/idle before starting another mode"}
         return {"ok": False, "error": "Unknown command"}
 
-    def _process_embedding(self, count, raw):
+    def _process_cancel_gesture(self, progress, confirmed):
+        with self.lock:
+            if self.operation != "login":
+                self.cancel_progress = 0.0
+                self.cancel_gesture_confirmed = False
+                return
+
+            if self.state in (
+                "matched_experimental",
+                "registered",
+                "timeout",
+                "error",
+                "stopping",
+                "idle",
+                "guest",
+            ):
+                return
+
+            self.cancel_progress = float(
+                np.clip(progress, 0.0, 1.0)
+            )
+
+            if confirmed:
+                self.cancel_gesture_confirmed = True
+
+    def _process_face_state(self, face_state):
+        """
+        Main 回報玩家是否已進入引導框。
+
+        login 的辨識延遲必須從「真正進入框框」才開始，
+        不能從 login command 被接受時開始，因為 OAK-D pipeline
+        啟動本身可能就需要數秒。
+        """
+        allowed_states = {
+            "waiting_face",
+            "multiple_faces",
+            "adjust_position",
+            "running",
+        }
+
+        if face_state not in allowed_states:
+            return
+
+        with self.lock:
+            if self.stop_event.is_set():
+                return
+
+            if self.operation not in ("login", "register"):
+                return
+
+            if self.state in (
+                "matched_experimental",
+                "registered",
+                "timeout",
+                "error",
+                "stopping",
+            ):
+                return
+
+            previous_state = self.state
+
+            if self.operation == "login":
+                if face_state == "running":
+                    # 只有從「不在正確位置」切換到「位置正確」時，
+                    # 才開始一次新的辨識延遲。
+                    if previous_state != "running":
+                        self.login_match_allowed_at = (
+                            monotonic()
+                            + FACE_LOGIN_PREVIEW_WARMUP_SECONDS
+                        )
+                        self.match_name = None
+                        self.match_streak = 0
+                        logging.info(
+                            "Face is inside guide; recognition will start "
+                            "after %.1f s. Raise hand during this window to cancel.",
+                            FACE_LOGIN_PREVIEW_WARMUP_SECONDS,
+                        )
+                else:
+                    # 一離開框框，就清除比對累積。
+                    # 下次重新進框會重新取得完整的取消時間。
+                    self.login_match_allowed_at = 0.0
+                    self.match_name = None
+                    self.match_streak = 0
+
+            self.state = face_state
+
+    @staticmethod
+    def _photo_quality_score(photo_bgr):
+        if photo_bgr is None or photo_bgr.size == 0:
+            return -1.0
+        try:
+            gray = cv2.cvtColor(photo_bgr, cv2.COLOR_BGR2GRAY)
+            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            h, w = gray.shape[:2]
+            area_bonus = float(h * w) / 1000.0
+            return sharpness + area_bonus
+        except Exception:
+            return -1.0
+
+    def _start_supabase_sync(self, user_id, samples, representative_photo):
+        if not _supabase_is_configured():
+            with self.lock:
+                self.cloud_sync_state = "error"
+                self.cloud_sync_error = (
+                    "SUPABASE_URL / SUPABASE_SECRET_KEY missing"
+                )
+            logging.error(
+                "Local face profile saved, but Supabase sync is not configured."
+            )
+            return
+
+        cloud_samples = [
+            np.asarray(v, dtype=np.float32).copy()
+            for v in samples
+        ]
+        cloud_photo = (
+            representative_photo.copy()
+            if representative_photo is not None
+            else None
+        )
+
+        def worker():
+            with self.lock:
+                self.cloud_sync_state = "syncing"
+                self.cloud_sync_error = None
+            try:
+                profile_id = sync_registration_to_supabase(
+                    user_id,
+                    cloud_samples,
+                    cloud_photo,
+                )
+                with self.lock:
+                    self.cloud_face_profile_id = profile_id
+                    self.cloud_sync_state = "complete"
+                    self.cloud_sync_error = None
+            except Exception as exc:
+                logging.exception(
+                    "Supabase face sync failed for user_id=%s",
+                    user_id,
+                )
+                with self.lock:
+                    self.cloud_sync_state = "error"
+                    self.cloud_sync_error = str(exc)
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"SupabaseFaceSync-{user_id}",
+            daemon=True,
+        )
+        self.cloud_sync_worker = thread
+        thread.start()
+
+    def _process_embedding(self, count, raw, face_photo=None):
         vector = normalize_embedding(raw)
         if vector is None:
             return
@@ -585,18 +1417,61 @@ class FaceController:
                     return
                 self.last_sample_at = monotonic()
                 self.samples.append(vector.copy())
+
+                photo_score = self._photo_quality_score(face_photo)
+                if photo_score > self.best_register_photo_score:
+                    self.best_register_photo_score = photo_score
+                    self.best_register_photo = (
+                        face_photo.copy()
+                        if face_photo is not None
+                        else None
+                    )
+
                 if len(self.samples) == SAMPLES_REQUIRED:
+                    saved_samples = [
+                        sample.copy()
+                        for sample in self.samples
+                    ]
+                    saved_photo = (
+                        self.best_register_photo.copy()
+                        if self.best_register_photo is not None
+                        else None
+                    )
                     try:
-                        # No face images; no overwrite of existing profile.
-                        save_profile_once(self.enroll_user, self.samples)
+                        # Keep the proven local profile as the login source/fallback.
+                        save_profile_once(
+                            self.enroll_user,
+                            saved_samples,
+                        )
                         self.user_id = self.enroll_user
                         self.state = "registered"
+
+                        # Cloud sync is intentionally asynchronous so network latency
+                        # cannot block camera release / Pose handoff / formal re-login.
+                        self._start_supabase_sync(
+                            self.enroll_user,
+                            saved_samples,
+                            saved_photo,
+                        )
                     except (OSError, ValueError) as exc:
                         self.last_error = str(exc)
                         self.state = "error"
+
                     self.samples = []
+                    self.best_register_photo = None
+                    self.best_register_photo_score = -1.0
                     self.stop_event.set()
             elif self.operation == "login":
+                # 必須先真的進入框框，且從進框那一刻起完整等待 warm-up。
+                # 這段時間 MediaPipe 舉手取消仍持續運作。
+                if (
+                    self.login_match_allowed_at <= 0.0
+                    or monotonic() < self.login_match_allowed_at
+                ):
+                    self.match_name = None
+                    self.match_streak = 0
+                    return
+
                 scores = {name: float(np.max(templates @ vector))
                           for name, templates in self.profiles.items()}
                 ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
@@ -625,9 +1500,11 @@ class FaceController:
             camera = Main()
             camera.stop_event = stop_event
             camera.on_embedding = self._process_embedding
+            camera.on_face_state = self._process_face_state
+            camera.on_cancel_gesture = self._process_cancel_gesture
             with self.lock:
                 if not stop_event.is_set():
-                    self.state = "running"
+                    self.state = "waiting_face"
             # Stops also on timeout, including when no face is detected.
             timer = threading.Timer(OPERATION_TIMEOUT, stop_event.set)
             timer.daemon = True
@@ -647,15 +1524,33 @@ class FaceController:
                 self.user_id = None
                 self.state = "error"
         finally:
+            # If camera.run() was entered, Main.run() closes self.device in its own
+            # finally clause before control reaches here. If Main() failed during
+            # construction, DepthAI.__init__ also closes any partially opened device.
+            # Therefore camera_released=True here is the handoff-safe signal for Unity.
             with self.lock:
                 if self.state == "stopping":
                     self.state = self.stop_target
-                elif self.state in ("starting", "running"):
-                    self.state = "timeout" if monotonic() >= self.deadline else self.stop_target
+                elif self.state in (
+                    "starting",
+                    "waiting_face",
+                    "multiple_faces",
+                    "adjust_position",
+                    "running",
+                ):
+                    self.state = (
+                        "timeout"
+                        if monotonic() >= self.deadline
+                        else self.stop_target
+                    )
                 self.samples = []
+                self.best_register_photo = None
+                self.best_register_photo_score = -1.0
                 self.operation = None
                 self.profiles = {}
-            # Main.run() closes the OAK-D in its finally clause.
+                self.camera_released = True
+
+            logging.info("Face camera released; OAK-D available for handoff")
 
     def shutdown(self):
         with self.lock:
@@ -663,6 +1558,8 @@ class FaceController:
             worker = self.worker
         if worker is not None and worker.is_alive():
             worker.join()  # Avoid releasing the process while the device is still open.
+        with self.lock:
+            self.camera_released = True
 
 
 if __name__ == "__main__":
@@ -674,6 +1571,17 @@ if __name__ == "__main__":
         if preview:
             logging.warning("--preview is for manual mode only; server mode runs headless")
             preview = False
+        if _supabase_is_configured():
+            logging.info(
+                "Supabase biometric sync configured "
+                "(secret key loaded from environment)."
+            )
+        else:
+            logging.warning(
+                "Supabase biometric sync is NOT configured; "
+                "local .npz registration will still work."
+            )
+
         controller = FaceController()
         try:
             run_server(controller.handle)
