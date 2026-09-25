@@ -404,6 +404,157 @@ def sync_registration_to_supabase(user_id, samples, representative_photo):
         raise
 
 
+def load_profiles_from_supabase():
+    """
+    Load active biometric profiles from Supabase.
+
+    Returns:
+        dict[str, np.ndarray]: user_id -> shape (N, 128)
+
+    Invalid/incomplete cloud profiles are skipped individually.
+    A transport/API failure raises so the caller can fall back to local .npz.
+    """
+    if not _supabase_is_configured():
+        raise RuntimeError(
+            "Supabase sync is not configured. "
+            "Set SUPABASE_URL and SUPABASE_SECRET_KEY."
+        )
+
+    profile_rows = _supabase_request(
+        "GET",
+        (
+            "/rest/v1/face_profiles"
+            "?select=face_profile_id,user_id"
+            "&is_active=eq.true"
+            "&order=face_profile_id.asc"
+        ),
+    )
+
+    if not isinstance(profile_rows, list):
+        raise RuntimeError("Invalid face_profiles response from Supabase")
+
+    profiles = {}
+
+    for row in profile_rows:
+        try:
+            face_profile_id = int(row["face_profile_id"])
+            user_id = str(int(row["user_id"]))
+        except (KeyError, TypeError, ValueError):
+            logging.warning(
+                "Skipping invalid Supabase face profile row: %r",
+                row,
+            )
+            continue
+
+        embedding_rows = _supabase_request(
+            "GET",
+            (
+                "/rest/v1/face_embeddings"
+                "?select=sample_index,embedding"
+                f"&face_profile_id=eq.{face_profile_id}"
+                "&order=sample_index.asc"
+            ),
+        )
+
+        if not isinstance(embedding_rows, list):
+            logging.warning(
+                "Skipping cloud profile %s for user %s: "
+                "invalid embedding response",
+                face_profile_id,
+                user_id,
+            )
+            continue
+
+        vectors = []
+        expected_index = 0
+        valid_profile = True
+
+        for item in embedding_rows:
+            try:
+                sample_index = int(item["sample_index"])
+                raw_embedding = item["embedding"]
+            except (KeyError, TypeError, ValueError):
+                valid_profile = False
+                break
+
+            if sample_index != expected_index:
+                valid_profile = False
+                break
+
+            vector = normalize_embedding(raw_embedding)
+            if vector is None:
+                valid_profile = False
+                break
+
+            vectors.append(vector)
+            expected_index += 1
+
+        # New registrations are expected to contain exactly 12 accepted samples.
+        if not valid_profile or len(vectors) != SAMPLES_REQUIRED:
+            logging.warning(
+                "Skipping incomplete cloud profile %s for user %s: "
+                "expected %d embeddings, got %d",
+                face_profile_id,
+                user_id,
+                SAMPLES_REQUIRED,
+                len(vectors),
+            )
+            continue
+
+        profiles[user_id] = np.stack(vectors).astype(np.float32)
+
+    return profiles
+
+
+def load_profiles_cloud_first_with_local_fallback():
+    """
+    Gradual migration strategy:
+    - Local .npz remains available for older users not yet uploaded.
+    - Valid active Supabase profiles override the same user_id locally.
+    - If Supabase is unavailable, login continues with local .npz only.
+    """
+    local_profiles = load_profiles()
+
+    try:
+        cloud_profiles = load_profiles_from_supabase()
+    except Exception as exc:
+        logging.warning(
+            "Supabase face profile load failed; using local .npz fallback only: %s",
+            exc,
+        )
+        if local_profiles:
+            logging.info(
+                "Face login profiles loaded from local fallback | users=%d",
+                len(local_profiles),
+            )
+        return local_profiles
+
+    if not cloud_profiles:
+        if local_profiles:
+            logging.warning(
+                "No valid active Supabase face profiles; "
+                "using local .npz fallback | users=%d",
+                len(local_profiles),
+            )
+        return local_profiles
+
+    merged = dict(local_profiles)
+    merged.update(cloud_profiles)
+
+    local_only_count = len(
+        set(local_profiles.keys()) - set(cloud_profiles.keys())
+    )
+
+    logging.info(
+        "Face login profiles ready | cloud=%d | local_only=%d | total=%d",
+        len(cloud_profiles),
+        local_only_count,
+        len(merged),
+    )
+
+    return merged
+
+
 def normalize_embedding(values):
     vec = np.asarray(values, dtype=np.float32).reshape(-1)
     if vec.size != 128 or not np.all(np.isfinite(vec)):
@@ -1171,9 +1322,15 @@ class FaceController:
                 if path.exists():
                     return {"ok": False, "error": "user_id already exists; will not overwrite"}
             else:
-                profiles = load_profiles()
+                profiles = load_profiles_cloud_first_with_local_fallback()
                 if not profiles:
-                    return {"ok": False, "error": "No enrolled profiles; register with consent first"}
+                    return {
+                        "ok": False,
+                        "error": (
+                            "No enrolled profiles available from Supabase "
+                            "or local .npz; register with consent first"
+                        ),
+                    }
             with self.lock:
                 if self.state in ("starting", "running", "stopping") or (
                     self.worker is not None and self.worker.is_alive()
@@ -1476,9 +1633,31 @@ class FaceController:
                           for name, templates in self.profiles.items()}
                 ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
                 name, top_score = ordered[0]
+                runner_up_name = ordered[1][0] if len(ordered) > 1 else None
                 runner_up = ordered[1][1] if len(ordered) > 1 else -1.0
+                score_margin = top_score - runner_up
+
+                # Diagnostic only: do NOT change threshold or match behavior.
+                # Log periodically so we can see whether failures come from
+                # low similarity or an ambiguity-margin collision.
+                if count == 1 or count % 30 == 0:
+                    logging.info(
+                        "Face match debug | best=%s | score=%.4f | "
+                        "runner_up=%s | runner_up_score=%.4f | "
+                        "margin=%.4f | threshold=%.4f | "
+                        "required_margin=%.4f | streak=%d",
+                        name,
+                        top_score,
+                        runner_up_name if runner_up_name is not None else "-",
+                        runner_up,
+                        score_margin,
+                        MATCH_THRESHOLD,
+                        AMBIGUITY_MARGIN,
+                        self.match_streak,
+                    )
+
                 accepted = (top_score >= MATCH_THRESHOLD and
-                            top_score - runner_up >= AMBIGUITY_MARGIN)
+                            score_margin >= AMBIGUITY_MARGIN)
                 if accepted:
                     if self.match_name == name:
                         self.match_streak += 1
